@@ -146,9 +146,11 @@ async function main(): Promise<void> {
   // catches /d/:slug requests first and blocks them.
   app.use(shareWebRoutes);
 
-  app.use('/d', requireThreadsAuth, createBridgeMountRouter(enforceBridgeClientCompatibility));
-  app.use('/documents', requireThreadsAuth, createBridgeMountRouter(enforceBridgeClientCompatibility));
-  app.use('/documents', requireThreadsAuth, agentRoutes);
+  // Bridge and document routes use slug-as-secret auth model — no hard Threads auth gate.
+  // The soft threadsAuthMiddleware (line 138) still attaches user info when available.
+  app.use('/d', createBridgeMountRouter(enforceBridgeClientCompatibility));
+  app.use('/documents', createBridgeMountRouter(enforceBridgeClientCompatibility));
+  app.use('/documents', agentRoutes);
 
   setupWebSocket(wss);
 
@@ -160,18 +162,16 @@ async function main(): Promise<void> {
       return;
     }
 
-    authenticateWsUpgrade(req).then((user) => {
-      if (!user) {
-        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-        socket.destroy();
-        return;
-      }
+    // Attempt auth but allow connections through regardless — slug-as-secret model.
+    // Authenticated users get richer capabilities; anonymous gets basic collab.
+    authenticateWsUpgrade(req).then(() => {
       wss.handleUpgrade(req, socket, head, (ws) => {
         wss.emit('connection', ws, req);
       });
     }).catch(() => {
-      socket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
-      socket.destroy();
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit('connection', ws, req);
+      });
     });
   });
 
