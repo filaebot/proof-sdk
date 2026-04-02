@@ -795,7 +795,7 @@ apiRoutes.post('/documents', (req: Request, res: Response) => {
     recordLegacyCreateRouteTelemetry(req, legacyCreateMode, 'allowed');
   }
 
-  const { markdown, marks, title, ownerId } = req.body;
+  const { markdown, marks, title, ownerId, slug: requestedSlug } = req.body;
 
   if (typeof markdown !== 'string') {
     res.status(400).json({
@@ -819,7 +819,17 @@ apiRoutes.post('/documents', (req: Request, res: Response) => {
     return;
   }
 
-  const slug = generateSlug();
+  // If a slug was requested and a document already exists with that slug, return it
+  if (typeof requestedSlug === 'string' && requestedSlug.length > 0) {
+    const existing = getDocumentBySlug(requestedSlug);
+    if (existing) {
+      const links = buildShareLink(req, existing.slug);
+      res.status(200).json({ slug: existing.slug, url: links.url, shareUrl: links.shareUrl, existed: true });
+      return;
+    }
+  }
+
+  const slug = (typeof requestedSlug === 'string' && requestedSlug.length > 0) ? requestedSlug : generateSlug();
   const ownerSecret = randomUUID();
   const normalizedMarks = canonicalizeStoredMarks(marks ?? {});
   const doc = createDocument(slug, sanitizedMarkdown, normalizedMarks, title, ownerId, ownerSecret);
