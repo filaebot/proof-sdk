@@ -137,9 +137,12 @@ async function main(): Promise<void> {
   // whether to require auth (share routes use their own share-token auth).
   app.use(threadsAuthMiddleware);
 
-  // /api/metrics and /api/agent require hard Threads auth
+  // /api/metrics requires hard Threads auth
   app.use('/api/metrics', requireThreadsAuth, metricsApiRoutes);
-  app.use('/api/agent', requireThreadsAuth, agentRoutes);
+  // Agent routes use slug-as-secret model (same as document routes) so the editor
+  // SPA can poll agent events from iframes where Threads session cookies aren't available.
+  // Agent routes have their own checkAuth() for per-document access control.
+  app.use('/api/agent', agentRoutes);
   // Document API routes use slug-as-secret model (no hard auth gate) so the editor
   // SPA can call them from iframes where Threads session cookies aren't available.
   // The soft threadsAuthMiddleware (line 138) still attaches user info when present.

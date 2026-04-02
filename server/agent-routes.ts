@@ -809,7 +809,9 @@ function checkAuth(
   }
 
   const secret = getPresentedSecret(req, slug);
-  const role = secret ? resolveDocumentAccessRole(slug, secret) : null;
+  // Tokenless links default to 'editor' role (slug-as-secret model), matching
+  // the document API routes in routes.ts resolveOpenContextAccess.
+  const role = secret ? resolveDocumentAccessRole(slug, secret) : 'editor' as ShareRole;
   const effectiveShareState = getEffectiveShareStateForRole(doc, role, Boolean(secret && role));
 
   if (effectiveShareState === 'REVOKED' && role !== 'owner_bot') {
