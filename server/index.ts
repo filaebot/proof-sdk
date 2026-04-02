@@ -16,6 +16,8 @@ import {
   enforceBridgeClientCompatibility,
 } from './client-capabilities.js';
 import { getBuildInfo } from './build-info.js';
+import { metricsApiRoutes } from './metrics.js';
+import { threadsAuthMiddleware, requireThreadsAuth, authenticateWsUpgrade } from './threads-auth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -25,6 +27,8 @@ const DEFAULT_ALLOWED_CORS_ORIGINS = [
   'http://127.0.0.1:3000',
   'http://localhost:4000',
   'http://127.0.0.1:4000',
+  'https://threads.filae.site',
+  'https://proof.filae.site',
   'null',
 ];
 
@@ -39,16 +43,26 @@ function parseAllowedCorsOrigins(): Set<string> {
 async function main(): Promise<void> {
   const app = express();
   const server = createServer(app);
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  const wss = new WebSocketServer({ noServer: true });
   const allowedCorsOrigins = parseAllowedCorsOrigins();
 
   app.use(express.json({ limit: '10mb' }));
+
+  // Serve built assets from dist/ (editor.js bundle) — no-cache for JS/CSS to avoid stale bundles
+  app.use(express.static(path.join(__dirname, '..', 'dist'), {
+    setHeaders: (res, filePath) => {
+      if (filePath.endsWith('.js') || filePath.endsWith('.css')) {
+        res.setHeader('Cache-Control', 'no-cache');
+      }
+    }
+  }));
   app.use(express.static(path.join(__dirname, '..', 'public')));
 
   app.use((req, res, next) => {
     const originHeader = req.header('origin');
     if (originHeader && allowedCorsOrigins.has(originHeader)) {
       res.setHeader('Access-Control-Allow-Origin', originHeader);
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
       res.setHeader('Vary', 'Origin');
     }
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
@@ -117,15 +131,50 @@ async function main(): Promise<void> {
   });
 
   app.use(discoveryRoutes);
-  app.use('/api', enforceApiClientCompatibility, apiRoutes);
-  app.use('/api/agent', agentRoutes);
-  app.use(apiRoutes);
-  app.use('/d', createBridgeMountRouter(enforceBridgeClientCompatibility));
-  app.use('/documents', createBridgeMountRouter(enforceBridgeClientCompatibility));
-  app.use('/documents', agentRoutes);
+
+  // Soft Threads auth — attaches req.threadsUser if credentials are present,
+  // but does NOT reject unauthenticated requests. Individual routes decide
+  // whether to require auth (share routes use their own share-token auth).
+  app.use(threadsAuthMiddleware);
+
+  // /api/metrics must be registered before the general /api routes
+  app.use('/api/metrics', requireThreadsAuth, metricsApiRoutes);
+  app.use('/api', requireThreadsAuth, enforceApiClientCompatibility, apiRoutes);
+  app.use('/api/agent', requireThreadsAuth, agentRoutes);
+  // Share web routes handle their own token-based auth — must be registered BEFORE
+  // the requireThreadsAuth-gated /d and /documents mounts, otherwise app.use('/d', ...)
+  // catches /d/:slug requests first and blocks them.
   app.use(shareWebRoutes);
 
+  app.use('/d', requireThreadsAuth, createBridgeMountRouter(enforceBridgeClientCompatibility));
+  app.use('/documents', requireThreadsAuth, createBridgeMountRouter(enforceBridgeClientCompatibility));
+  app.use('/documents', requireThreadsAuth, agentRoutes);
+
   setupWebSocket(wss);
+
+  // Authenticate WebSocket upgrade requests before handing off to the WSS
+  server.on('upgrade', (req, socket, head) => {
+    const url = new URL(req.url || '', `http://${req.headers.host}`);
+    if (url.pathname !== '/ws') {
+      socket.destroy();
+      return;
+    }
+
+    authenticateWsUpgrade(req).then((user) => {
+      if (!user) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit('connection', ws, req);
+      });
+    }).catch(() => {
+      socket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+      socket.destroy();
+    });
+  });
+
   await startCollabRuntimeEmbedded(PORT);
 
   server.listen(PORT, () => {

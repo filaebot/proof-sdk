@@ -25,7 +25,7 @@ import {
   type MarkKind,
   type ReplaceData,
 } from '../../formats/marks.js';
-import { getMarks, marksPluginKey, resolveMarks } from './marks';
+import { getMarks, getResolvedMarks, marksPluginKey, resolveMarks } from './marks';
 import { isMobileTouch } from './mobile-detect';
 
 export type HeatMapMode = 'hidden' | 'subtle' | 'background' | 'full';
@@ -518,6 +518,7 @@ export const heatmapPlugin = $prose((ctx) => {
       let cachedSegments: CachedSegment[] = [];
       let needsRebuild = true;
       let renderRafId: number | null = null;
+      let rebuildTimeout: ReturnType<typeof setTimeout> | null = null;
 
       // Get or create gutter container
       const gutterEl = document.getElementById('provenance-gutter');
@@ -559,9 +560,12 @@ export const heatmapPlugin = $prose((ctx) => {
       const getMarksByKind = () => {
         const marksState = marksPluginKey.getState(editorView.state);
         if (!marksState) return null;
-        const allMarks = getMarks(editorView.state);
-        const resolvedMarks = resolveGutterMarks(editorView.state.doc, allMarks);
-        return groupMarksByKind(resolvedMarks);
+        const resolved = getResolvedMarks(editorView.state);
+        const resolvedMarkRanges = resolved.flatMap(mark => {
+          const ranges = mark.resolvedRanges ?? (mark.resolvedRange ? [mark.resolvedRange] : []);
+          return ranges.map(range => ({ mark, from: range.from, to: range.to }));
+        });
+        return groupMarksByKind(resolvedMarkRanges);
       };
 
       const renderDirectViewport = () => {
@@ -623,41 +627,15 @@ export const heatmapPlugin = $prose((ctx) => {
       // Initial build
       runRender(true);
 
-      // Scroll polling (desktop: fast transform updates; mobile: direct viewport re-render)
-      let scrollPollId: number | null = null;
-      let lastEditorTop: number | null = null;
-      let lastViewportOffsetTop: number | null = null;
-      let lastViewportHeight: number | null = null;
-
-      const pollScroll = () => {
-        const editorRect = editorView.dom.getBoundingClientRect();
-        const currentTop = editorRect.top;
-        const vv = window.visualViewport;
-        const currentViewportOffsetTop = vv?.offsetTop ?? 0;
-        const currentViewportHeight = vv?.height ?? window.innerHeight;
-
+      // Scroll handler (replaces RAF poll to avoid continuous work when idle)
+      const onScroll = () => {
         if (useDirectViewportRender) {
-          if (
-            lastEditorTop === null
-            || Math.abs(currentTop - lastEditorTop) > 0.5
-            || lastViewportOffsetTop === null
-            || Math.abs(currentViewportOffsetTop - lastViewportOffsetTop) > 0.5
-            || lastViewportHeight === null
-            || Math.abs(currentViewportHeight - lastViewportHeight) > 0.5
-          ) {
-            scheduleRender(true);
-          }
-        } else if (lastEditorTop !== null && Math.abs(currentTop - lastEditorTop) > 0.5) {
+          scheduleRender(true);
+        } else {
           updateScroll();
         }
-
-        lastEditorTop = currentTop;
-        lastViewportOffsetTop = currentViewportOffsetTop;
-        lastViewportHeight = currentViewportHeight;
-        scrollPollId = requestAnimationFrame(pollScroll);
       };
-
-      scrollPollId = requestAnimationFrame(pollScroll);
+      window.addEventListener('scroll', onScroll, { passive: true });
 
       // Resize / visual viewport handlers
       let resizeTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -676,12 +654,17 @@ export const heatmapPlugin = $prose((ctx) => {
 
       return {
         update() {
-          scheduleRender(true);
+          // Debounce heatmap rebuild so typing doesn't trigger per-keystroke recalculation
+          if (rebuildTimeout !== null) clearTimeout(rebuildTimeout);
+          rebuildTimeout = setTimeout(() => {
+            scheduleRender(true);
+          }, 250);
         },
         destroy() {
-          if (scrollPollId !== null) cancelAnimationFrame(scrollPollId);
           if (renderRafId !== null) cancelAnimationFrame(renderRafId);
           if (resizeTimeout !== null) clearTimeout(resizeTimeout);
+          if (rebuildTimeout !== null) clearTimeout(rebuildTimeout);
+          window.removeEventListener('scroll', onScroll);
           window.removeEventListener('resize', onResize);
           window.visualViewport?.removeEventListener('resize', onViewportChange);
           window.visualViewport?.removeEventListener('scroll', onViewportChange);

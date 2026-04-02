@@ -59,6 +59,7 @@ function getAnchorBox(view: EditorView, range: MarkRange) {
 
 function positionBar(bar: HTMLElement, view: EditorView, range: MarkRange): void {
   try {
+    // --- DOM reads (batched) ---
     const anchorBox = getAnchorBox(view, range);
     if (typeof view.dom.getBoundingClientRect !== 'function') return;
     if (typeof bar.getBoundingClientRect !== 'function') return;
@@ -69,34 +70,39 @@ function positionBar(bar: HTMLElement, view: EditorView, range: MarkRange): void
     const viewportW = window.innerWidth;
     const viewportH = window.innerHeight;
     const safeTop = getTopViewportInset(margin);
-    const maxTop = Math.max(safeTop, viewportH - barRect.height - margin);
+
+    // --- DOM writes (all reads complete above) ---
+    const barW = barRect.width;
+    const barH = barRect.height;
+    const maxTop = Math.max(safeTop, viewportH - barH - margin);
     const spaceRight = viewportW - editorRect.right;
     const spaceLeft = editorRect.left;
-    const canDockRight = spaceRight >= barRect.width + dockGap;
-    const canDockLeft = spaceLeft >= barRect.width + dockGap;
+    const canDockRight = spaceRight >= barW + dockGap;
+    const canDockLeft = spaceLeft >= barW + dockGap;
+
+    let left: number;
+    let top: number;
 
     if (canDockRight || canDockLeft) {
       const dockRight = canDockRight || !canDockLeft;
-      const left = dockRight
-        ? clamp(editorRect.right + dockGap, margin, viewportW - barRect.width - margin)
-        : clamp(editorRect.left - dockGap - barRect.width, margin, viewportW - barRect.width - margin);
-      const top = clamp(anchorBox.top - 6, safeTop, maxTop);
-      bar.style.left = `${left}px`;
-      bar.style.top = `${top}px`;
-      return;
+      left = dockRight
+        ? clamp(editorRect.right + dockGap, margin, viewportW - barW - margin)
+        : clamp(editorRect.left - dockGap - barW, margin, viewportW - barW - margin);
+      top = clamp(anchorBox.top - 6, safeTop, maxTop);
+    } else {
+      const aboveTop = anchorBox.top - barH - margin;
+      const belowTop = anchorBox.bottom + margin;
+      const hasRoomAbove = aboveTop >= safeTop;
+      const hasRoomBelow = belowTop + barH <= viewportH - margin;
+      top = hasRoomAbove
+        ? aboveTop
+        : (hasRoomBelow
+          ? belowTop
+          : clamp(anchorBox.top, safeTop, maxTop));
+      const center = (anchorBox.left + anchorBox.right) / 2;
+      left = clamp(center - barW / 2, margin, viewportW - barW - margin);
     }
 
-    const aboveTop = anchorBox.top - barRect.height - margin;
-    const belowTop = anchorBox.bottom + margin;
-    const hasRoomAbove = aboveTop >= safeTop;
-    const hasRoomBelow = belowTop + barRect.height <= viewportH - margin;
-    const top = hasRoomAbove
-      ? aboveTop
-      : (hasRoomBelow
-        ? belowTop
-        : clamp(anchorBox.top, safeTop, maxTop));
-    const center = (anchorBox.left + anchorBox.right) / 2;
-    const left = clamp(center - barRect.width / 2, margin, viewportW - barRect.width - margin);
     bar.style.left = `${left}px`;
     bar.style.top = `${top}px`;
   } catch {
@@ -171,8 +177,8 @@ class MarkSelectionBarController {
     document.addEventListener('selectionchange', this.handleSelectionChange);
     view.dom.addEventListener('pointerup', this.handlePointerUp);
     view.dom.addEventListener('keyup', this.handleKeyUp);
-    window.addEventListener('scroll', this.handleScroll);
-    window.addEventListener('resize', this.handleScroll);
+    window.addEventListener('scroll', this.handleScroll, { passive: true });
+    window.addEventListener('resize', this.handleScroll, { passive: true });
   }
 
   destroy(): void {

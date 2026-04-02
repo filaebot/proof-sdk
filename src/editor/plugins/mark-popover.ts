@@ -506,10 +506,10 @@ class MarkPopoverController {
     view.dom.addEventListener('click', this.handleEditorClick);
     view.dom.addEventListener('touchstart', this.handleEditorTouchStart, { passive: true });
     view.dom.addEventListener('touchend', this.handleEditorTouchEnd);
-    window.addEventListener('scroll', this.handleScroll);
-    window.addEventListener('resize', this.handleScroll);
-    window.visualViewport?.addEventListener('resize', this.handleViewportChange);
-    window.visualViewport?.addEventListener('scroll', this.handleViewportChange);
+    window.addEventListener('scroll', this.handleScroll, { passive: true });
+    window.addEventListener('resize', this.handleScroll, { passive: true });
+    window.visualViewport?.addEventListener('resize', this.handleViewportChange, { passive: true });
+    window.visualViewport?.addEventListener('scroll', this.handleViewportChange, { passive: true });
 
     this.handleSelectionChange = () => {
       const mobile = isMobileTouch();

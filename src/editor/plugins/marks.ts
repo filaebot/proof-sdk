@@ -48,6 +48,9 @@ export interface MarksPluginState {
   metadata: Record<string, StoredMark>;
   activeMarkId: string | null;
   composeAnchorRange?: MarkRange | null;
+  cachedMarks?: Mark[];
+  cachedMarksDoc?: ProseMirrorNode;
+  cachedResolvedMarks?: ResolvedMark[];
 }
 
 export const marksPluginKey = new PluginKey<MarksPluginState>('marks');
@@ -1505,7 +1508,22 @@ function collectMarks(state: EditorState): Mark[] {
 // ============================================================================
 
 export function getMarks(state: EditorState): Mark[] {
+  const pluginState = marksPluginKey.getState(state);
+  if (!pluginState) return [];
+  if (pluginState.cachedMarks && pluginState.cachedMarksDoc === state.doc) {
+    return pluginState.cachedMarks;
+  }
   return collectMarks(state);
+}
+
+export function getResolvedMarks(state: EditorState): ResolvedMark[] {
+  const pluginState = marksPluginKey.getState(state);
+  if (!pluginState) return [];
+  if (pluginState.cachedResolvedMarks && pluginState.cachedMarksDoc === state.doc) {
+    return pluginState.cachedResolvedMarks;
+  }
+  const marks = getMarks(state);
+  return resolveMarks(state.doc, marks);
 }
 
 export function getActiveMarkId(state: EditorState): string | null {
@@ -3012,11 +3030,96 @@ export function updateMarksAfterEdit(_view: EditorView, _editFrom: number, _edit
 // ============================================================================
 
 export function resolveMarks(doc: ProseMirrorNode, marks: Mark[]): ResolvedMark[] {
+  // Authored marks use mark.range directly — no doc traversal needed.
+  // For all other marks, collect ranges in a single doc.descendants() pass
+  // instead of one pass per mark (N marks = N traversals was the bottleneck).
+  const anchorMarkTypeNames = new Set([
+    MARK_TYPE_NAMES.suggestion,
+    MARK_TYPE_NAMES.comment,
+    MARK_TYPE_NAMES.flagged,
+    MARK_TYPE_NAMES.approved,
+  ]);
+
+  const markIds = new Set<string>();
+  for (const mark of marks) {
+    if (mark.kind !== 'authored') {
+      markIds.add(mark.id);
+    }
+  }
+
+  // Single-pass: collect ranges for all non-authored marks at once
+  const rangesById = new Map<string, MarkRange[]>();
+  const currentById = new Map<string, MarkRange>();
+
+  if (markIds.size > 0) {
+    doc.descendants((node, pos) => {
+      if (!node.isText) {
+        // Flush all open ranges when we leave text context
+        for (const [id, current] of currentById) {
+          const arr = rangesById.get(id);
+          if (arr) arr.push(current); else rangesById.set(id, [current]);
+        }
+        currentById.clear();
+        return true;
+      }
+
+      // Collect which mark IDs this text node carries
+      const matchedIds = new Set<string>();
+      for (const nodeMark of node.marks) {
+        if (anchorMarkTypeNames.has(nodeMark.type.name)) {
+          const id = nodeMark.attrs.id as string;
+          if (id && markIds.has(id)) {
+            matchedIds.add(id);
+          }
+        }
+      }
+
+      const from = pos;
+      const to = pos + node.nodeSize;
+
+      // For IDs that matched: extend or start a range
+      for (const id of matchedIds) {
+        const current = currentById.get(id);
+        if (current && from <= current.to) {
+          current.to = Math.max(current.to, to);
+        } else {
+          if (current) {
+            const arr = rangesById.get(id);
+            if (arr) arr.push(current); else rangesById.set(id, [current]);
+          }
+          currentById.set(id, { from, to });
+        }
+      }
+
+      // For IDs that had an open range but did NOT match this node: flush
+      for (const [id, current] of currentById) {
+        if (!matchedIds.has(id)) {
+          const arr = rangesById.get(id);
+          if (arr) arr.push(current); else rangesById.set(id, [current]);
+          currentById.delete(id);
+        }
+      }
+
+      return true;
+    });
+
+    // Finalize any open ranges
+    for (const [id, current] of currentById) {
+      const arr = rangesById.get(id);
+      if (arr) arr.push(current); else rangesById.set(id, [current]);
+    }
+  }
+
   return marks.map(mark => {
-    const ranges = collectAnchorRanges(doc, mark);
-    const effectiveRanges = ranges.length > 0
-      ? ranges
-      : (mark.range ? [mark.range] : []);
+    let effectiveRanges: MarkRange[];
+    if (mark.kind === 'authored') {
+      effectiveRanges = mark.range ? [mark.range] : [];
+    } else {
+      const collected = rangesById.get(mark.id) ?? [];
+      effectiveRanges = collected.length > 0
+        ? collected
+        : (mark.range ? [mark.range] : []);
+    }
     return {
       ...mark,
       resolvedRange: effectiveRanges[0] ?? null,
@@ -3490,6 +3593,8 @@ export const marksPlugin = $prose(() => {
           }
         }
 
+        const isYjsSync = Boolean(tr.getMeta(ySyncPluginKey));
+
         if (tr.docChanged) {
           const currentComposeRange = nextState.composeAnchorRange ?? null;
           const mappedComposeRange = nextState.composeAnchorRange
@@ -3506,10 +3611,55 @@ export const marksPlugin = $prose(() => {
           if (composeRangeChanged) {
             nextState = { ...nextState, composeAnchorRange: mappedComposeRange };
           }
-          const normalized = normalizeMetadata(nextState.metadata, tr.doc);
-          if (normalized !== nextState.metadata) {
-            nextState = { ...nextState, metadata: normalized };
+          // Only normalize metadata when mark structure might have changed.
+          // Yjs syncs bring remote changes that may add/remove anchors.
+          // Pure local text typing doesn't change anchor structure, so skip the
+          // full doc tree walk that getProofAnchorIds performs inside normalizeMetadata.
+          if (isYjsSync || meta) {
+            const normalized = normalizeMetadata(nextState.metadata, tr.doc);
+            if (normalized !== nextState.metadata) {
+              nextState = { ...nextState, metadata: normalized };
+            }
           }
+        }
+
+        // Cache marks and resolved marks for decorations() and external consumers.
+        // Fast path: when typing plain text (no mark structure changes), map existing
+        // cached positions through the transaction mapping instead of doing expensive
+        // full doc.descendants() traversals via buildAnchorMarks + resolveMarks.
+        const hasMarkSteps = tr.steps.some(step =>
+          step.constructor.name === 'AddMarkStep' || step.constructor.name === 'RemoveMarkStep'
+        );
+        const isPureTextTyping = tr.docChanged && !meta && !isYjsSync && !hasMarkSteps;
+
+        if (isPureTextTyping && value.cachedMarks && value.cachedResolvedMarks) {
+          const mappedMarks = value.cachedMarks.map(mark => ({
+            ...mark,
+            range: mark.range ? {
+              from: tr.mapping.map(mark.range.from, -1),
+              to: tr.mapping.map(mark.range.to, 1),
+            } : undefined,
+          }));
+          const mappedResolved = value.cachedResolvedMarks.map(mark => ({
+            ...mark,
+            range: mark.range ? {
+              from: tr.mapping.map(mark.range.from, -1),
+              to: tr.mapping.map(mark.range.to, 1),
+            } : undefined,
+            resolvedRange: mark.resolvedRange ? {
+              from: tr.mapping.map(mark.resolvedRange.from, -1),
+              to: tr.mapping.map(mark.resolvedRange.to, 1),
+            } : null,
+            resolvedRanges: mark.resolvedRanges?.map(r => ({
+              from: tr.mapping.map(r.from, -1),
+              to: tr.mapping.map(r.to, 1),
+            })),
+          }));
+          nextState = { ...nextState, cachedMarks: mappedMarks, cachedMarksDoc: tr.doc, cachedResolvedMarks: mappedResolved };
+        } else {
+          const cachedMarks = buildAnchorMarks(tr.doc, nextState.metadata);
+          const cachedResolvedMarks = resolveMarks(tr.doc, cachedMarks);
+          nextState = { ...nextState, cachedMarks, cachedMarksDoc: tr.doc, cachedResolvedMarks };
         }
 
         return nextState;
@@ -3520,9 +3670,12 @@ export const marksPlugin = $prose(() => {
       decorations(state) {
         const pluginState = marksPluginKey.getState(state);
         if (!pluginState) return DecorationSet.empty;
+        const marks = (pluginState.cachedMarksDoc === state.doc && pluginState.cachedMarks)
+          ? pluginState.cachedMarks
+          : collectMarks(state);
         return createDecorations(
           state,
-          collectMarks(state),
+          marks,
           pluginState.activeMarkId,
           pluginState.composeAnchorRange ?? null
         );
