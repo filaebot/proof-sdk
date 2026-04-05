@@ -137,6 +137,19 @@ async function main(): Promise<void> {
   // whether to require auth (share routes use their own share-token auth).
   app.use(threadsAuthMiddleware);
 
+  // Hard auth gate for document editor pages — requires Threads auth
+  // (token relay, session cookie, or API key). Only gates GET /d/:slug
+  // (the editor HTML page), not bridge API calls under /d/:slug/bridge/*.
+  app.use((req, res, next) => {
+    if (req.method === 'GET' && /^\/d\/[^/]+\/?$/.test(req.path)) {
+      if (!req.threadsUser) {
+        res.status(401).json({ error: 'Authentication required' });
+        return;
+      }
+    }
+    next();
+  });
+
   // /api/metrics requires hard Threads auth
   app.use('/api/metrics', requireThreadsAuth, metricsApiRoutes);
   // Agent routes use slug-as-secret model (same as document routes) so the editor

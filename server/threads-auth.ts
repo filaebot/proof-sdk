@@ -1,3 +1,4 @@
+import { createHmac } from 'crypto';
 import type { Request, Response, NextFunction } from 'express';
 import type { IncomingMessage } from 'http';
 
@@ -128,6 +129,56 @@ function isValidApiKey(req: Request): boolean {
   return match?.[1] === PROOF_API_KEY;
 }
 
+// ── Threads token relay auth ────────────────────────────────────────────────
+
+function extractThreadsToken(req: Request): string | null {
+  // Check query parameter (initial page load from Threads iframe)
+  const token = typeof req.query.threads_token === 'string' ? req.query.threads_token : null;
+  if (token) return token;
+
+  // Check header (for API calls or postMessage-relayed refreshes)
+  const header = req.header('x-threads-token');
+  if (header) return header;
+
+  return null;
+}
+
+function validateThreadsToken(token: string): ThreadsUser | null {
+  if (!PROOF_API_KEY) return null;
+
+  const dotIndex = token.indexOf('.');
+  if (dotIndex < 0) return null;
+
+  const payloadB64 = token.slice(0, dotIndex);
+  const sigB64 = token.slice(dotIndex + 1);
+
+  try {
+    // Verify HMAC-SHA256 signature using Node.js crypto
+    const expectedSig = createHmac('sha256', PROOF_API_KEY)
+      .update(payloadB64)
+      .digest('base64url');
+
+    if (expectedSig !== sigB64) return null;
+
+    // Decode payload (base64url -> JSON)
+    const payloadJson = Buffer.from(payloadB64, 'base64url').toString('utf-8');
+    const payload = JSON.parse(payloadJson);
+
+    // Check expiry
+    if (typeof payload.exp !== 'number' || payload.exp < Math.floor(Date.now() / 1000)) {
+      return null;
+    }
+
+    return {
+      id: payload.sub,
+      username: payload.username || 'unknown',
+      display_name: null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 // ── Express middleware ─────────────────────────────────────────────────────────
 
 export function threadsAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
@@ -136,6 +187,17 @@ export function threadsAuthMiddleware(req: Request, res: Response, next: NextFun
     req.threadsUser = { id: 'api-key', username: 'api-key', display_name: 'API Key' };
     next();
     return;
+  }
+
+  // Threads token relay — HMAC-signed short-lived tokens from Threads API
+  const threadsToken = extractThreadsToken(req);
+  if (threadsToken) {
+    const tokenUser = validateThreadsToken(threadsToken);
+    if (tokenUser) {
+      req.threadsUser = tokenUser;
+      next();
+      return;
+    }
   }
 
   const token = extractSessionToken(req);
