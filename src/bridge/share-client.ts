@@ -113,6 +113,7 @@ function sleep(ms: number): Promise<void> {
 export class ShareClient {
   private slug: string | null = null;
   private shareToken: string | null = null;
+  private threadsToken: string | null = null;
   private everySessionToken: string | null = null;
   private apiOriginOverride: string | null = null;
   private clientId: string | null = null;
@@ -126,8 +127,27 @@ export class ShareClient {
   private clientBuild = 'web';
   private clientProtocol = '3';
 
+  /** Allowed parent origins that may relay a Threads auth token via postMessage. */
+  private static TRUSTED_TOKEN_ORIGINS = ['https://threads.filae.site'];
+
   constructor() {
     this.detectShareMode();
+    this.listenForThreadsToken();
+  }
+
+  /**
+   * Listen for Threads auth tokens delivered via postMessage from the parent frame.
+   * This replaces passing the token as a URL query parameter (security issue #14).
+   */
+  private listenForThreadsToken(): void {
+    window.addEventListener('message', (event: MessageEvent) => {
+      if (!ShareClient.TRUSTED_TOKEN_ORIGINS.includes(event.origin)) return;
+      if (event.data?.type !== 'threads-token') return;
+      const token = typeof event.data.token === 'string' ? event.data.token.trim() : '';
+      if (!token) return;
+      this.threadsToken = token;
+      console.log('[ShareClient] Received Threads token via postMessage');
+    });
   }
 
   private detectShareMode(): void {
@@ -235,6 +255,9 @@ export class ShareClient {
     };
     if (token) {
       headers['x-share-token'] = token;
+    }
+    if (this.threadsToken) {
+      headers['x-threads-token'] = this.threadsToken;
     }
     if (this.everySessionToken) {
       headers.Authorization = `Bearer ${this.everySessionToken}`;
